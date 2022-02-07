@@ -2,6 +2,7 @@
 The client is designed to work in conjunction with the [REST Web Camera server](https://github.com/iLya2IK/wcwebcamserver).
 
 Current project PCB configuration:
+
 ![alt text](https://github.com/iLya2IK/webcamdevice/blob/main/webcamdevicesample.png?raw=true)
 
 # Sub-protocol description
