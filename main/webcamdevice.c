@@ -60,6 +60,8 @@ static esp_adc_cal_characteristics_t *adc_chars;
 static adc_channel_t adc_channel;
 static SemaphoreHandle_t adc_mux = NULL;
 volatile uint32_t adc_value = 0; // value in mV
+static esp_timer_handle_t adc_probe;
+#define ADC_PROBE_TIMER_DELTA 2000000
 #endif
 
 /* camera config - ov2640 driver */
@@ -653,7 +655,9 @@ static void camera_task(void *args)
         #ifdef ADC_ENABLED
         /* measure the current voltage value with adc */
         if (locked_CHK_STATE(MODE_ADC_PROBE)) {
+            esp_timer_stop(adc_probe);
             board_get_adc_mV();
+            esp_timer_start_periodic(adc_probe, MODE_ADC_PROBE);
         }
         #endif
 
@@ -834,7 +838,7 @@ uint32_t board_get_adc_mV(void) {
         adc2_get_raw((adc2_channel_t)adc_channel, ADC_WIDTH_BIT_12, &raw);
         adc_new_value += raw;
     }
-    adc_value /= ADC_NO_OF_SAMPLES;
+    adc_new_value /= ADC_NO_OF_SAMPLES;
     if (xSemaphoreTake(adc_mux, portMAX_DELAY) == pdTRUE) {
         adc_value = adc_new_value;
         xSemaphoreGive(adc_mux);
@@ -850,6 +854,13 @@ uint32_t locked_get_adc_voltage() {
         xSemaphoreGive(adc_mux);
     }
     return v;
+}
+
+void adc_probe_cb(void* arg)
+{
+    if (CHK_STATE(MODE_CONN)) {
+        SET_STATE(ADC_PROBE_TIMER_DELTA);
+    }
 }
 
 #endif
@@ -902,6 +913,9 @@ void finalize_app()
     esp_timer_stop(frame_send);
     esp_timer_stop(msgs_send);
     esp_timer_stop(msgs_get);
+    #ifdef ADC_ENABLED
+    esp_timer_stop(adc_probe);
+    #endif
 
     h2pc_finalize();
 
@@ -956,6 +970,11 @@ void app_main()
     timer_args.callback = &msgs_send_cb;
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &msgs_send));
 
+    #ifdef ADC_ENABLED
+    timer_args.callback = &adc_probe_cb;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &msgs_send));
+    #endif
+
     /* start main task */
     xTaskCreate(&camera_task, "camera_task", (1024 * 64), NULL, 5, NULL);
 
@@ -964,4 +983,7 @@ void app_main()
     esp_timer_start_periodic(msgs_get, GET_MSG_TIMER_DELTA);
     esp_timer_start_periodic(msgs_send, SEND_MSG_TIMER_DELTA);
     esp_timer_start_once(frame_send, SEND_FRAME_TIMER_DELTA);
+    #ifdef ADC_ENABLED
+    esp_timer_start_periodic(adc_probe, ADC_PROBE_TIMER_DELTA);
+    #endif
 }
