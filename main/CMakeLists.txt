@@ -1,4 +1,5 @@
-set(COMPONENT_SRCS "webcamdevice.c"
+set(COMPONENT_SRCS "ble_config.c" 
+                   "webcamdevice.c"
                    "http2_protoclient.c" 
                    "button.c"                    
                    "cam_hal.c"

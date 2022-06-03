@@ -16,21 +16,45 @@ menu "WebCam Configuration"
 
     config SERVER_URI
         string "Server URI"
-        default "https://82.146.46.158:443"
+        default "https://uri"
         help
             Server host URI.
 
     config SERVER_NAME
         string "Server user name"
-        default "user"
+        default "user name"
         help
             The name of user for authorization
 
     config SERVER_PASS
         string "Server user password"
-        default "111"
+        default "user password"
         help
             The password for authorization
+            
+    config WC_DEVICE_NAME
+        string "BLE device service config"
+        default "babaikaWCCamv1"
+        help
+            The value of BLE UUID for service                   
+            
+    config WC_DEVICE_SERVICE_UUID
+        hex "BLE device service config"
+        default 0x9ef0
+        help
+            The value of BLE UUID for service            
+            
+    config WC_DEVICE_CHAR1_UUID
+        hex "BLE device char 1 config"
+        default 0x9ef1
+        help
+            The value of BLE UUID for char 1 (write char)
+            
+    config WC_DEVICE_CHAR2_UUID
+        hex "BLE device char 2 config"
+        default 0x9ef2
+        help
+            The value of BLE UUID for char 2 (read char)           
 
 endmenu
 menu "Buttons Configuration"

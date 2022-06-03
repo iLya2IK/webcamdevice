@@ -101,7 +101,7 @@ typedef struct {
     QueueHandle_t frame_buffer_queue;
     TaskHandle_t task_handle;
     intr_handle_t cam_intr_handle;
-	
+
     uint8_t dma_num;//ESP32-S3
     intr_handle_t dma_intr_handle;//ESP32-S3
 
@@ -126,6 +126,7 @@ typedef struct {
 
 bool ll_cam_stop(cam_obj_t *cam);
 bool ll_cam_start(cam_obj_t *cam, int frame_pos);
+void ll_cam_vsync_manual(cam_obj_t * cam);
 esp_err_t ll_cam_config(cam_obj_t *cam, const camera_config_t *config);
 esp_err_t ll_cam_deinit(cam_obj_t *cam);
 void ll_cam_vsync_intr_enable(cam_obj_t *cam, bool en);

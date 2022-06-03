@@ -143,7 +143,7 @@ void h2pc_disconnect_http2() {
 bool h2pc_connect_to_http2(char * aserver) {
     /* HTTP2: one connection multiple requests. Do the TLS/TCP connection first */
     #ifdef LOG_DEBUG
-    ESP_LOGI(WC_TAG, "Connecting to server");
+    ESP_LOGI(WC_TAG, "Connecting to server: %s", aserver);
     #endif
     if (sh2lib_connect(&hd, aserver) != 0) {
         #ifdef LOG_DEBUG

@@ -243,9 +243,9 @@ int sh2lib_connect(struct sh2lib_handle *hd, const char *uri)
         .alpn_protos = proto,
         .non_block = true,
         .timeout_ms = 10000,
-    };    
+    };
     if ((hd->http2_tls = esp_tls_conn_http_new(uri, &tls_cfg)) == NULL) {
-        ESP_LOGE(TAG, "[sh2-connect] esp-tls connection failed");
+        ESP_LOGE(TAG, "[sh2-connect] esp-tls connection failed %s", uri);
         goto error;
     }
     struct http_parser_url u;
@@ -345,12 +345,12 @@ int sh2lib_do_putpost_with_nv(struct sh2lib_handle *hd, const nghttp2_nv *nva, s
 }
 
 int sh2lib_do_post(struct sh2lib_handle *hd, const char *path,
-                   int32_t total_len, 
+                   int32_t total_len,
                    sh2lib_putpost_data_cb_t send_cb,
                    sh2lib_frame_data_recv_cb_t recv_cb)
 {
     char p[17];
-    itoa (total_len, p, 10);    
+    itoa (total_len, p, 10);
     const nghttp2_nv nva[] = { SH2LIB_MAKE_NV(":method", "POST"),
                                SH2LIB_MAKE_NV(":scheme", "https"),
                                SH2LIB_MAKE_NV(":authority", hd->hostname),
@@ -371,4 +371,3 @@ int sh2lib_do_put(struct sh2lib_handle *hd, const char *path,
                              };
     return sh2lib_do_putpost_with_nv(hd, nva, sizeof(nva) / sizeof(nva[0]), send_cb, recv_cb);
 }
-

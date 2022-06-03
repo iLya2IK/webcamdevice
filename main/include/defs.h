@@ -6,9 +6,11 @@
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
 
-#define LOG_DEBUG
+//#define LOG_DEBUG
 
-extern const char *WC_TAG;
+extern const char * WC_TAG;
+
+extern const char const DEVICE_NAME [];
 
 #define ADC_ENABLED
 #define OUT_ENABLED

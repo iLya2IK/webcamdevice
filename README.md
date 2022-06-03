@@ -1,5 +1,6 @@
 # HTTP2 Web Camera Client Device
 The client is designed to work in conjunction with the [REST Web Camera server](https://github.com/iLya2IK/wcwebcamserver).
+Device configuration via BLE.
 
 Electronic schematic for current project
 

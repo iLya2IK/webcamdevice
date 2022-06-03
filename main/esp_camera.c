@@ -218,6 +218,10 @@ static esp_err_t camera_probe(const camera_config_t *config, camera_model_t *out
     return ESP_OK;
 }
 
+void esp_camera_do_snap() {
+    cam_do_snap();
+}
+
 esp_err_t esp_camera_init(const camera_config_t *config)
 {
     esp_err_t err;

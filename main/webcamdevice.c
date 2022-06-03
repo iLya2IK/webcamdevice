@@ -16,14 +16,15 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+
+#include "ble_config.h"
+
 #include "esp_wifi.h"
 #include "http2_protoclient.h"
 #include "esp_event_loop.h"
 #include "lwip/apps/sntp.h"
 #include "driver/gpio.h"
-#ifdef LOG_DEBUG
 #include "esp_log.h"
-#endif
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "esp_camera.h"
@@ -33,6 +34,7 @@ const char *WC_TAG = "camhttp2-rsp";
 
 /* mac address for device */
 static char mac_str[13];
+static cJSON * device_meta_data = NULL;
 const char UPPER_XDIGITS[] = "0123456789ABCDEF";
 
 /* io config */
@@ -90,11 +92,13 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG, //PIXFORMAT_RGB565, //YUV422,GRAYSCALE,RGB565,JPEG
-    .frame_size = FRAMESIZE_XGA,    //QQVGA-UXGA Do not use sizes above QVGA when not JPEG
+    .frame_size = FRAMESIZE_SXGA,    //QQVGA-UXGA Do not use sizes above QVGA when not JPEG
 
     .jpeg_quality = 12, //0-63 lower number means higher quality
     .fb_count = 1,       //if more than one, i2s runs in continuous mode. Use only with JPEG
-    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+    .grab_mode = CAMERA_GRAB_LATEST,
+
+    .fb_location = CAMERA_FB_IN_PSRAM
 };
 
 /* wifi config */
@@ -118,30 +122,64 @@ const int WIFI_CONNECTED_BIT = BIT0;
 /* Commands */
 #define HTTP2_STREAMING_AUTH_PATH     "/authorize.json"
 #define HTTP2_STREAMING_ADDREC_PATH   "/addRecord.json?shash="
-#define HTTP2_STREAMING_GETMSGS_PATH  "/getMsgs.json"
+#define HTTP2_STREAMING_GETMSGS_PATH  "/getMsgsAndSync.json"
 #define HTTP2_STREAMING_ADDMSGS_PATH  "/addMsgs.json"
 
 /* JSON-RPC fields */
-static const char * JSON_RPC_OK      = "OK";
-static const char * JSON_RPC_BAD     = "BAD";
-static const char * JSON_RPC_MSG     = "msg";
+static const char * JSON_RPC_OK      =  "OK";
+static const char * JSON_RPC_BAD     =  "BAD";
+
+static const char * REST_SYNC_MSG    =  "{\"msg\":\"sync\"}";
+static const char * JSON_RPC_SYNC    =  "sync";
+static const char * JSON_RPC_MSG     =  "msg";
 static const char * JSON_RPC_MSGS    =  "msgs";
 static const char * JSON_RPC_RESULT  =  "result";
+static const char * JSON_RPC_CODE    =  "code";
 static const char * JSON_RPC_NAME    =  "name";
 static const char * JSON_RPC_PASS    =  "pass";
 static const char * JSON_RPC_SHASH   =  "shash";
 static const char * JSON_RPC_META    =  "meta";
-static const char * JSON_RPC_REC     =  "record";
 static const char * JSON_RPC_STAMP   =  "stamp";
-static const char * JSON_RPC_RID     =  "rid";
 static const char * JSON_RPC_MID     =  "mid";
 static const char * JSON_RPC_DEVICE  =  "device";
 static const char * JSON_RPC_TARGET  =  "target";
 static const char * JSON_RPC_PARAMS  =  "params";
 
+static const uint8_t REST_RESULT_OK             = 0;
+static const uint8_t REST_ERR_UNSPECIFIED       = 1;
+static const uint8_t REST_ERR_INTERNAL_UNK      = 2;
+static const uint8_t REST_ERR_DATABASE_FAIL     = 3;
+static const uint8_t REST_ERR_JSON_PARSER_FAIL  = 4;
+static const uint8_t REST_ERR_JSON_FAIL         = 5;
+static const uint8_t REST_ERR_NO_SUCH_SESSION   = 6;
+static const uint8_t REST_ERR_NO_SUCH_USER      = 7;
+static const uint8_t REST_ERR_NO_DEVICES        = 8;
+static const uint8_t REST_ERR_NO_SUCH_RECORD    = 9;
+static const uint8_t REST_ERR_NO_DATA_RETURNED  = 10;
+static const uint8_t REST_ERR_EMPTY_REQUEST     = 11;
+static const uint8_t REST_ERR_MALFORMED_REQUEST = 12;
+
+static const char * REST_RESPONSE_ERRORS[]  = {
+                              "NO_ERROR",
+                              "UNSPECIFIED",
+                              "INTERNAL_UNKNOWN_ERROR",
+                              "DATABASE_FAIL",
+                              "JSON_PARSER_FAIL",
+                              "JSON_FAIL",
+                              "NO_SUCH_SESSION",
+                              "NO_SUCH_USER",
+                              "NO_DEVICES_ONLINE",
+                              "NO_SUCH_RECORD",
+                              "NO_DATA_RETURNED",
+                              "EMPTY_REQUEST",
+                              "MALFORMED_REQUEST"};
+
+/* JSON-RPC device metadata */
+/* device's write char to identify */
+static const char * JSON_BLE_CHAR    = "ble_char";
+
 
 /* MSGS */
-static const char * JSON_RPC_SYNC        =  "sync";
 static const char * JSON_RPC_DOSNAP      =  "dosnap";
 #ifdef ADC_ENABLED
 static const char * JSON_RPC_GET_ADCVAL  =  "getadcval";
@@ -168,8 +206,6 @@ static const char * JSON_RPC_PIN         =  "pin";
 #define MODE_SEND_FB  0x0004
 // get messages from server. is need to get messages
 #define MODE_GET_MSG  0x0008
-// send sync msg. is need to send sync msg to server
-#define MODE_SYNC 0x0010
 // send msg. is need to send msg from pool to server
 #define MODE_SEND_MSG 0x0020
 #ifdef ADC_ENABLED
@@ -181,11 +217,9 @@ static const char * JSON_RPC_PIN         =  "pin";
 static char * sid = NULL;                   // current session id
 volatile int  connect_errors = 0;           // connection failed tryes count
 volatile int  protocol_errors = 0;          // protocol errors count
-static char * sync_msg = NULL;              // cached sync msg
-static char * sync_stamp = NULL;            // cached sync msg with sid
 static char * last_stamp = NULL;            // last time stamp from server
-volatile int incoming_msgs_pos = 0;         // helpers work with the pool of incoming msgs
-volatile int incoming_msgs_size = 0;
+volatile int  incoming_msgs_pos = 0;         // helpers work with the pool of incoming msgs
+volatile int  incoming_msgs_size = 0;
 
 /* state routes */
 volatile uint16_t http2_state = MODE_NONE;  // client state mask
@@ -241,16 +275,14 @@ static void locked_CLR_ALL_STATES() {
 }
 
 /* timers */
-static esp_timer_handle_t frame_send;
 static esp_timer_handle_t msgs_get;
 static esp_timer_handle_t msgs_send;
 #define GET_MSG_TIMER_DELTA 5000000
 #define SEND_MSG_TIMER_DELTA 5000000
-#define SEND_FRAME_TIMER_DELTA 60000000
 
 /* forward decrlarations */
 void finalize_app();
-void add_outgoing_msg(char * amsg, char * atarget, cJSON * content);
+void add_outgoing_msg(const char * amsg, char * atarget, cJSON * content);
 #ifdef ADC_ENABLED
 uint32_t locked_get_adc_voltage();
 #endif
@@ -272,7 +304,7 @@ static void set_time(void)
 
 /* encode sid to percent-string */
 static void encode_sid(char * dst) {
-    if (!sid) return 0;
+    if (!sid) return;
     int p =0;
     for (int i = 0; i < strlen(sid); i++) {
         char c = sid[i];
@@ -290,6 +322,24 @@ static void encode_sid(char * dst) {
     dst[p] = 0;
 }
 
+static uint8_t get_error_code(cJSON * resp) {
+    cJSON * code = cJSON_GetObjectItem(resp, JSON_RPC_CODE);
+    if (code != NULL && cJSON_IsNumber(code)) {
+        return (uint8_t)code->valueint;
+    } else
+        return REST_ERR_UNSPECIFIED;
+}
+
+static void consume_protocol_error(cJSON * resp) {
+    protocol_errors++; // some server error
+    uint8_t err_code = get_error_code(resp);
+    ESP_LOGE(WC_TAG, "protocol error %d (%s)", err_code, REST_RESPONSE_ERRORS[err_code]);
+    if (err_code == REST_ERR_NO_SUCH_SESSION) {
+        locked_CLR_ALL_STATES();
+        locked_SET_STATE(MODE_AUTH);
+    }
+}
+
 /* disconnect from host. reset all states */
 static void disconnect_host() {
     if (locked_CHK_STATE(MODE_CONN)) h2pc_disconnect_http2();
@@ -302,7 +352,13 @@ static void disconnect_host() {
 static void connect_to_http2() {
     disconnect_host();
 
-    if (h2pc_connect_to_http2(HTTP2_SERVER_URI)) {
+    char * addr;
+    if (WC_CFG_VALUES != NULL)
+        addr = get_cfg_value(CFG_HOST_NAME);
+    else
+        addr = HTTP2_SERVER_URI;
+
+    if (h2pc_connect_to_http2(addr)) {
         connect_errors = 0;
         locked_SET_STATE(MODE_CONN | MODE_AUTH);
     } else
@@ -310,9 +366,7 @@ static void connect_to_http2() {
 }
 
 static void send_authorize() {
-    #ifdef LOG_DEBUG
     ESP_LOGI(WC_TAG, "Trying to authorize");
-    #endif
 
     if (sid) {
         cJSON_free(sid);
@@ -320,9 +374,17 @@ static void send_authorize() {
     }
     /* HTTP GET SID */
     cJSON * tosend = cJSON_CreateObject();
-    cJSON_AddStringToObject(tosend, JSON_RPC_NAME, HTTP2_SERVER_NAME);
-    cJSON_AddStringToObject(tosend, JSON_RPC_PASS, HTTP2_SERVER_PASS);
+    if (WC_CFG_VALUES != NULL) {
+        cJSON_AddStringToObject(tosend, JSON_RPC_NAME, get_cfg_value(CFG_USER_NAME));
+        cJSON_AddStringToObject(tosend, JSON_RPC_PASS, get_cfg_value(CFG_USER_PASSWORD));
+    }
+    else {
+        cJSON_AddStringToObject(tosend, JSON_RPC_NAME, HTTP2_SERVER_NAME);
+        cJSON_AddStringToObject(tosend, JSON_RPC_PASS, HTTP2_SERVER_PASS);
+    }
+
     cJSON_AddStringToObject(tosend, JSON_RPC_DEVICE, mac_str);
+    cJSON_AddItemToObject(tosend, JSON_RPC_META,   device_meta_data);
     h2pc_prepare_to_send(tosend);
     cJSON_Delete(tosend);
     h2pc_do_post(HTTP2_STREAMING_AUTH_PATH);
@@ -337,39 +399,28 @@ static void send_authorize() {
             strcpy(sid, hash);
             locked_CLR_STATE(MODE_AUTH);
             locked_SET_STATE(MODE_GET_MSG);
-            #ifdef LOG_DEBUG
             ESP_LOGI(WC_TAG, "hash=%s",sid);
-            #endif
-            if (sync_msg) {
-                cJSON_free(sync_msg);
-                sync_msg = NULL;
-            }
-            cJSON * tosend = cJSON_CreateObject();
-            cJSON_AddStringToObject(tosend, JSON_RPC_SHASH, sid);
-            cJSON_AddStringToObject(tosend, JSON_RPC_MSG, JSON_RPC_SYNC);
-            sync_msg = cJSON_PrintUnformatted(tosend);
-            cJSON_Delete(tosend);
+            protocol_errors = 0;
 
-            strcpy(last_stamp, sync_stamp);
-        } else
-            protocol_errors++; // some server error
+            strcpy(last_stamp, REST_SYNC_MSG);
+        } else {
+            consume_protocol_error(resp);
+        }
         cJSON_Delete(resp);
     }
 }
 
 static void send_framebuffer() {
     camera_fb_t *pic = esp_camera_fb_get();
+
     // use pic->buf to access the image
-    #ifdef LOG_DEBUG
     ESP_LOGI(WC_TAG, "Picture taken. Its size was: %zu bytes", pic->len);
-    #endif
 
     // prepare path?query string
     char * aPath = cJSON_malloc(128);
     memset(aPath, 0, 128);
-    int len = strlen(HTTP2_STREAMING_ADDREC_PATH);
-    memcpy(aPath, HTTP2_STREAMING_ADDREC_PATH, len);
-    encode_sid(&(aPath[len]));
+    memcpy(aPath, HTTP2_STREAMING_ADDREC_PATH, sizeof(HTTP2_STREAMING_ADDREC_PATH)-1);
+    encode_sid(&(aPath[sizeof(HTTP2_STREAMING_ADDREC_PATH)-1]));
 
     h2pc_prepare_to_send_static((char *) pic->buf, pic->len);
     h2pc_do_post(aPath);
@@ -385,8 +436,9 @@ static void send_framebuffer() {
         if (result &&
             (strcmp(result->valuestring, JSON_RPC_OK) == 0)) {
             locked_CLR_STATE(MODE_SEND_FB);
-        } else
-            protocol_errors++; // some server error
+        } else {
+            consume_protocol_error(resp);
+        }
         cJSON_Delete(resp);
     }
 }
@@ -414,30 +466,14 @@ static void send_get_msgs() {
                     incoming_msgs_pos = 0;
                     h2pc_set_incoming_pool(msgs);
                 }
-            } else
-                protocol_errors++; // some server error
+            } else {
+                consume_protocol_error(resp);
+            }
             cJSON_Delete(resp);
         }
         h2pc_unlock_incoming_pool();
     }
     locked_CLR_STATE(MODE_GET_MSG);
-}
-
-static void send_sync() {
-    h2pc_prepare_to_send_static(sync_msg, strlen(sync_msg));
-    h2pc_do_post(HTTP2_STREAMING_ADDMSGS_PATH);
-    h2pc_wait_for_response();
-    /* extract result */
-    cJSON * resp  = h2pc_consume_response_content();
-    if (resp) {
-        cJSON * result = cJSON_GetObjectItem(resp, JSON_RPC_RESULT);
-        if (result &&
-            (strcmp(result->valuestring, JSON_RPC_OK) == 0)) {
-            locked_CLR_STATE(MODE_SYNC);
-        } else
-            protocol_errors++; // some server error
-        cJSON_Delete(resp);
-    }
 }
 
 static void send_msgs() {
@@ -481,7 +517,7 @@ static void send_msgs() {
                     }
                     h2pc_unlock_outgoing_pool();
                 }
-                protocol_errors++; // some server error
+                consume_protocol_error(resp);
             }
             cJSON_Delete(resp);
         }
@@ -490,7 +526,6 @@ static void send_msgs() {
 }
 
 static void proceed_incoming_msgs() {
-    bool need_to_sync = false;
     if (h2pc_lock_incoming_pool()) {
         cJSON * incoming_msgs = h2pc_incoming_pool();
         if (incoming_msgs && (incoming_msgs_pos < incoming_msgs_size)) {
@@ -507,7 +542,7 @@ static void proceed_incoming_msgs() {
                     if (stmp) strcpy(last_stamp, stmp->valuestring);
                     cJSON * smid;
                     if (spars) {
-                        cJSON * smid = cJSON_GetObjectItem(spars, JSON_RPC_MID); //msg id
+                        smid = cJSON_GetObjectItem(spars, JSON_RPC_MID); //msg id
                     } else smid = NULL;
 
                     /* check completeness */
@@ -562,7 +597,6 @@ static void proceed_incoming_msgs() {
                 incoming_msgs_pos++;
                 if (incoming_msgs_pos >= incoming_msgs_size) {
                     h2pc_clr_incoming_pool();
-                    need_to_sync = true;
                     break;
                 }
                 if (cnt > 2) {
@@ -573,10 +607,9 @@ static void proceed_incoming_msgs() {
         }
         h2pc_unlock_incoming_pool();
     }
-    if (need_to_sync) locked_SET_STATE(MODE_SYNC);
 }
 
-void add_outgoing_msg(char * amsg, char * atarget, cJSON * content) {
+void add_outgoing_msg(const char * amsg, char * atarget, cJSON * content) {
     if (h2pc_lock_outgoing_pool()) {
         cJSON * outgoing_msgs = h2pc_outgoing_pool();
         if (outgoing_msgs == NULL) {
@@ -596,103 +629,20 @@ void add_outgoing_msg(char * amsg, char * atarget, cJSON * content) {
     }
 }
 
-static void camera_task(void *args)
-{
-    /* Waiting for connection */
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
-                        false, true, portMAX_DELAY);
-
-    /* Set current time: proper system time is required for TLS based
-     * certificate verification.
-     */
-    set_time();
-
-    while (1)
-    {
-        #ifdef LOG_DEBUG
-        ESP_LOGI(WC_TAG, "New step. states: %d", locked_GET_STATES());
-        #endif
-        if (!locked_CHK_STATE(MODE_CONN)) {
-            connect_to_http2();
-            if (connect_errors) {
-                if (connect_errors > 10) {
-                    vTaskDelay(300 * configTICK_RATE_HZ); // 5 minutes
-                } else {
-                    vTaskDelay(connect_errors * 10 * configTICK_RATE_HZ);
-                }
-            }
-        }
-        /* authorize the device on server */
-        if (locked_CHK_STATE(MODE_AUTH)) {
-            send_authorize();
-        }
-        /* send sync msg to server */
-        if (locked_CHK_STATE(MODE_SYNC)) {
-            send_sync();
-        }
-        /* gathering incoming msgs from server */
-        if (locked_CHK_STATE(MODE_GET_MSG)) {
-            esp_timer_stop(msgs_get);
-            send_get_msgs();
-            esp_timer_start_periodic(msgs_get, GET_MSG_TIMER_DELTA);
-        }
-        /* proceed incoming messages */
-        proceed_incoming_msgs();
-
-        /* send outgoing messages */
-        if (locked_CHK_STATE(MODE_SEND_MSG)) {
-            esp_timer_stop(msgs_send);
-            send_msgs();
-            esp_timer_start_periodic(msgs_send, SEND_MSG_TIMER_DELTA);
-        }
-        /* send framebuffer */
-        if (locked_CHK_STATE(MODE_SEND_FB)) {
-            esp_timer_stop(frame_send);
-            send_framebuffer();
-            esp_timer_start_once(frame_send, SEND_FRAME_TIMER_DELTA);
-        }
-
-        #ifdef ADC_ENABLED
-        /* measure the current voltage value with adc */
-        if (locked_CHK_STATE(MODE_ADC_PROBE)) {
-            esp_timer_stop(adc_probe);
-            board_get_adc_mV();
-            esp_timer_start_periodic(adc_probe, MODE_ADC_PROBE);
-        }
-        #endif
-
-        if (protocol_errors > 10) {
-            disconnect_host();
-        }
-
-        vTaskDelay(1000);
-    }
-
-    finalize_app();
-
-    vTaskDelete(NULL);
-}
-
 static esp_err_t event_handler(void *ctx, system_event_t *event)
 {
     switch (event->event_id) {
     case SYSTEM_EVENT_STA_START:
-        #ifdef LOG_DEBUG
         ESP_LOGI(WC_TAG, "SYSTEM_EVENT_STA_START");
-        #endif
         ESP_ERROR_CHECK(esp_wifi_connect());
         break;
     case SYSTEM_EVENT_STA_GOT_IP:
-        #ifdef LOG_DEBUG
         ESP_LOGI(WC_TAG, "SYSTEM_EVENT_STA_GOT_IP");
         ESP_LOGI(WC_TAG, "got ip:%s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
-        #endif
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
         break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
-        #ifdef LOG_DEBUG
         ESP_LOGI(WC_TAG, "SYSTEM_EVENT_STA_DISCONNECTED");
-        #endif
         if (locked_CHK_STATE(MODE_CONN)) h2pc_disconnect_http2();
         locked_CLR_ALL_STATES();
 
@@ -714,15 +664,27 @@ static void initialise_wifi(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
     ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = APP_WIFI_SSID,
-            .password = APP_WIFI_PASS,
-        },
-    };
-    #ifdef LOG_DEBUG
+    wifi_config_t wifi_config;
+    memset(&wifi_config, 0x00, sizeof(wifi_config_t));
+
+    char * value = get_cfg_value(CFG_SSID_NAME);
+    if (value != NULL) {
+        strcpy((char *) &(wifi_config.sta.ssid[0]), value);
+        ESP_LOGD(WC_TAG, "SSID setted from json config");
+    } else {
+        strcpy((char *) &(wifi_config.sta.ssid[0]), APP_WIFI_SSID);
+        ESP_LOGD(WC_TAG, "SSID setted from flash config");
+    }
+    value = get_cfg_value(CFG_SSID_PASSWORD);
+    if (value != NULL) {
+        strcpy((char *) &(wifi_config.sta.password[0]), value);
+        ESP_LOGD(WC_TAG, "Password setted from json config");
+    } else {
+        strcpy((char *) &(wifi_config.sta.password[0]), APP_WIFI_PASS);
+        ESP_LOGD(WC_TAG, "Password setted from flash config");
+    }
+
     ESP_LOGI(WC_TAG, "Setting WiFi configuration SSID %s...", wifi_config.sta.ssid);
-    #endif
     ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
     ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
     ESP_ERROR_CHECK( esp_wifi_start() );
@@ -734,9 +696,7 @@ static esp_err_t init_camera()
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK)
     {
-        #ifdef LOG_DEBUG
         ESP_LOGE(WC_TAG, "Camera Init Failed");
-        #endif
         return err;
     }
 
@@ -746,9 +706,7 @@ static esp_err_t init_camera()
 #ifdef INP_ENABLED
 static void button_tap_cb(void* arg)
 {
-    #ifdef LOG_DEBUG
     ESP_LOGI(WC_TAG, "tap cb (%s)", (char *)arg);
-    #endif
 
     /* find the pressed button and react */
     for (int i = 0; i < BUTTONS_CNT; i++) {
@@ -766,9 +724,8 @@ static void board_buttons_init(void)
 {
     for (int i = 0; i < BUTTONS_CNT; i++) {
         buttons[i].handle = iot_button_create(buttons[i].pin, buttons[i].active_level);
-        if (buttons[i].handle) {
+        if (buttons[i].handle)
             iot_button_set_evt_cb(buttons[i].handle, BUTTON_CB_PUSH, button_tap_cb, buttons[i].arg);
-        }
     }
 }
 #endif
@@ -786,9 +743,7 @@ void board_out_operation(uint8_t pin, uint8_t onoff)
         }
         return;
     }
-    #ifdef LOG_DEBUG
     ESP_LOGE(WC_TAG, "Out is not found!");
-    #endif
 }
 
 static void board_out_init(void)
@@ -826,7 +781,8 @@ static void board_adc_init(void)
     }
     adc_mux = xSemaphoreCreateMutex();
     adc_chars = calloc(1, sizeof(esp_adc_cal_characteristics_t));
-    esp_adc_cal_value_t val_type = esp_adc_cal_characterize(ADC_UNIT_2, ADC_ATTEN_DB_0, ADC_WIDTH_BIT_12, 1100, adc_chars);
+    //esp_adc_cal_value_t val_type =
+    esp_adc_cal_characterize(ADC_UNIT_2, ADC_ATTEN_DB_0, ADC_WIDTH_BIT_12, 1100, adc_chars);
     adc2_config_channel_atten((adc2_channel_t)adc_channel, ADC_ATTEN_DB_0);
 }
 
@@ -858,94 +814,99 @@ uint32_t locked_get_adc_voltage() {
 
 void adc_probe_cb(void* arg)
 {
-    if (CHK_STATE(MODE_CONN)) {
-        SET_STATE(ADC_PROBE_TIMER_DELTA);
-    }
+    if ( CHK_STATE(MODE_CONN) )
+        SET_STATE( ADC_PROBE_TIMER_DELTA );
 }
 
 #endif
 
-void frames_send_cb(void* arg)
-{
-    #ifdef LOG_DEBUG
-    ESP_LOGI(WC_TAG, "Frame send fired");
-    #endif
-    if (xSemaphoreTake(states_mux, portMAX_DELAY) == pdTRUE) {
-        if (CHK_STATE(MODE_CONN)) {
-            SET_STATE(MODE_SEND_FB);
-        }
-        xSemaphoreGive(states_mux);
-    }
-}
-
 void msgs_get_cb(void* arg)
 {
-    #ifdef LOG_DEBUG
-    ESP_LOGI(WC_TAG, "Get msgs fired");
-    #endif
+    ESP_LOGD(WC_TAG, "Get msgs fired");
     bool isempty = h2pc_locked_incoming_pool_waiting();
     if (isempty && (xSemaphoreTake(states_mux, portMAX_DELAY) == pdTRUE)) {
-        if (CHK_STATE(MODE_CONN)) {
+        if (CHK_STATE(MODE_CONN))
             SET_STATE(MODE_GET_MSG);
-        }
         xSemaphoreGive(states_mux);
     }
 }
 
 void msgs_send_cb(void* arg)
 {
-    #ifdef LOG_DEBUG
-    ESP_LOGI(WC_TAG, "Send msgs fired");
-    #endif
+    ESP_LOGD(WC_TAG, "Send msgs fired");
     bool isnempty = h2pc_locked_outgoing_pool_waiting();
     if (isnempty && (xSemaphoreTake(states_mux, portMAX_DELAY) == pdTRUE)) {
-        if (CHK_STATE(MODE_CONN)) {
+        if (CHK_STATE(MODE_CONN))
             SET_STATE(MODE_SEND_MSG);
-        }
         xSemaphoreGive(states_mux);
     }
 }
 
-void finalize_app()
+static void main_task(void *args)
 {
-    disconnect_host();
+    nvs_handle my_handle;
+    esp_err_t err;
+    cJSON * loc_cfg = NULL;
 
-    esp_timer_stop(frame_send);
-    esp_timer_stop(msgs_send);
-    esp_timer_stop(msgs_get);
-    #ifdef ADC_ENABLED
-    esp_timer_stop(adc_probe);
-    #endif
-
-    h2pc_finalize();
-
-    if (sync_msg) cJSON_free(sync_msg);
-    if (sync_stamp) cJSON_free(sync_stamp);
-}
-
-void app_main()
-{
-    states_mux = xSemaphoreCreateMutex();
-
-    ESP_ERROR_CHECK( nvs_flash_init() );
-    initialise_wifi();
-    ESP_ERROR_CHECK( init_camera() );
-    h2pc_initialize();
-
-    /* generate the sync msg */
-    uint8_t sta_mac[6];
-    ESP_ERROR_CHECK( esp_efuse_mac_get_default(sta_mac) );
-    for (int i = 0; i < 6; i++) {
-        mac_str[i<<1] = UPPER_XDIGITS[(sta_mac[i] >> 4) & 0x0f];
-        mac_str[(i<<1) + 1] = UPPER_XDIGITS[(sta_mac[i] & 0x0f)];
+    err = nvs_open("device_config", NVS_READWRITE, &my_handle);
+    if (err == ESP_OK) {
+        size_t required_size;
+        err = nvs_get_str(my_handle, JSON_CFG, NULL, &required_size);
+        if (err == ESP_OK) {
+            char * cfg_str = malloc(required_size);
+            nvs_get_str(my_handle, JSON_CFG, cfg_str, &required_size);
+            loc_cfg = cJSON_Parse(cfg_str);
+            cJSON_free(cfg_str);
+        }
     }
-    mac_str[12] = 0;
-    last_stamp = cJSON_malloc(64);
-    cJSON * sync = cJSON_CreateObject();
-    cJSON_AddStringToObject( sync, JSON_RPC_MSG, JSON_RPC_SYNC );
-    sync_stamp = cJSON_PrintUnformatted(sync);
-    strcpy(last_stamp, sync_stamp);
-    cJSON_Delete(sync);
+    if (loc_cfg == NULL) {
+        loc_cfg = cJSON_CreateArray();
+        cJSON * cfg_item = cJSON_CreateObject();
+        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_DEVICE_NAME), mac_str);
+        cJSON_AddItemToArray(loc_cfg, cfg_item);
+        cfg_item = cJSON_CreateObject();
+        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_USER_NAME), HTTP2_SERVER_NAME);
+        cJSON_AddItemToArray(loc_cfg, cfg_item);
+        cfg_item = cJSON_CreateObject();
+        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_USER_PASSWORD), HTTP2_SERVER_PASS);
+        cJSON_AddItemToArray(loc_cfg, cfg_item);
+        cfg_item = cJSON_CreateObject();
+        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_HOST_NAME), HTTP2_SERVER_URI);
+        cJSON_AddItemToArray(loc_cfg, cfg_item);
+        cfg_item = cJSON_CreateObject();
+        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_SSID_NAME), APP_WIFI_SSID);
+        cJSON_AddItemToArray(loc_cfg, cfg_item);
+        cfg_item = cJSON_CreateObject();
+        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_SSID_PASSWORD), APP_WIFI_PASS);
+        cJSON_AddItemToArray(loc_cfg, cfg_item);
+    }
+
+    error_t ret = initialize_ble(loc_cfg);
+    cJSON_Delete(loc_cfg);
+    if (ret == OK) {
+        start_ble_config_round();
+        while ( ble_config_proceed() ) {
+            vTaskDelay(1000);
+        }
+        stop_ble_config_round();
+
+        if (WC_CFG_VALUES != NULL) {
+            char * cfg_str = cJSON_PrintUnformatted(WC_CFG_VALUES);
+            size_t required_size = strlen(cfg_str);
+            nvs_set_blob(my_handle, JSON_CFG, cfg_str, required_size);
+            nvs_commit(my_handle);
+
+            #ifdef LOG_DEBUG
+            esp_log_buffer_char(JSON_CFG, cfg_str, required_size);
+            #endif
+
+            cJSON_free(cfg_str);
+        }
+    }
+    nvs_close(my_handle);
+
+    h2pc_initialize();
+    initialise_wifi();
 
     /* intialize io */
     #ifdef INP_ENABLED
@@ -959,10 +920,7 @@ void app_main()
     #endif
 
     /* init timers */
-    esp_timer_create_args_t timer_args = {
-        .callback = &frames_send_cb,
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &frame_send));
+    esp_timer_create_args_t timer_args;
 
     timer_args.callback = &msgs_get_cb;
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &msgs_get));
@@ -975,15 +933,133 @@ void app_main()
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &msgs_send));
     #endif
 
-    /* start main task */
-    xTaskCreate(&camera_task, "camera_task", (1024 * 64), NULL, 5, NULL);
-
-
     /* start timers */
     esp_timer_start_periodic(msgs_get, GET_MSG_TIMER_DELTA);
     esp_timer_start_periodic(msgs_send, SEND_MSG_TIMER_DELTA);
-    esp_timer_start_once(frame_send, SEND_FRAME_TIMER_DELTA);
     #ifdef ADC_ENABLED
     esp_timer_start_periodic(adc_probe, ADC_PROBE_TIMER_DELTA);
     #endif
+
+    /* Waiting for connection */
+    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
+                        false, true, portMAX_DELAY);
+
+    /* Set current time: proper system time is required for TLS based
+     * certificate verification.
+     */
+    set_time();
+
+    while (1)
+    {
+        ESP_LOGI(WC_TAG, "New step. states: %d", locked_GET_STATES());
+
+        if (!locked_CHK_STATE(MODE_CONN)) {
+            connect_to_http2();
+            if (connect_errors) {
+                if (connect_errors > 10) {
+                    vTaskDelay(300 * configTICK_RATE_HZ); // 5 minutes
+                } else {
+                    vTaskDelay(connect_errors * 10 * configTICK_RATE_HZ);
+                }
+            }
+        }
+        /* authorize the device on server */
+        if (locked_CHK_STATE(MODE_AUTH)) {
+            send_authorize();
+        }
+        /* gathering incoming msgs from server */
+        if (locked_CHK_STATE(MODE_GET_MSG)) {
+            esp_timer_stop(msgs_get);
+            send_get_msgs();
+            esp_timer_start_periodic(msgs_get, GET_MSG_TIMER_DELTA);
+        }
+        /* proceed incoming messages */
+        proceed_incoming_msgs();
+
+        /* send outgoing messages */
+        if (locked_CHK_STATE(MODE_SEND_MSG)) {
+            esp_timer_stop(msgs_send);
+            send_msgs();
+            esp_timer_start_periodic(msgs_send, SEND_MSG_TIMER_DELTA);
+        }
+        /* send framebuffer */
+        if (locked_CHK_STATE(MODE_SEND_FB)) {
+            esp_camera_do_snap();
+            vTaskDelay(1000);
+            send_framebuffer();
+        }
+
+        #ifdef ADC_ENABLED
+        /* measure the current voltage value with adc */
+        if (locked_CHK_STATE(MODE_ADC_PROBE)) {
+            esp_timer_stop(adc_probe);
+            board_get_adc_mV();
+            esp_timer_start_periodic(adc_probe, MODE_ADC_PROBE);
+        }
+        #endif
+
+        if (protocol_errors > 10) {
+            disconnect_host();
+        }
+
+        vTaskDelay(1000);
+    }
+
+    finalize_app();
+
+    vTaskDelete(NULL);
+}
+
+
+void finalize_app()
+{
+    disconnect_host();
+
+    esp_timer_stop(msgs_send);
+    esp_timer_stop(msgs_get);
+    #ifdef ADC_ENABLED
+    esp_timer_stop(adc_probe);
+    #endif
+
+    h2pc_finalize();
+
+    if (last_stamp) cJSON_free(last_stamp);
+    if (device_meta_data) cJSON_free(device_meta_data);
+}
+
+static char DEVICE_CHAR [] = "00000000-0000-1000-8000-00805f9b4f3b";
+
+void app_main()
+{
+    states_mux = xSemaphoreCreateMutex();
+
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK( err );
+    ESP_ERROR_CHECK( init_camera() );
+
+    /* generate mac address and device metadata */
+    uint8_t sta_mac[6];
+    ESP_ERROR_CHECK( esp_efuse_mac_get_default(sta_mac) );
+    for (int i = 0; i < 6; i++) {
+        mac_str[i<<1] = UPPER_XDIGITS[(sta_mac[i] >> 4) & 0x0f];
+        mac_str[(i<<1) + 1] = UPPER_XDIGITS[(sta_mac[i] & 0x0f)];
+    }
+
+    mac_str[12] = 0;
+    last_stamp = cJSON_malloc(128);
+    last_stamp[0] = 0;
+
+    DEVICE_CHAR[4] = UPPER_XDIGITS[(uint8_t)((CONFIG_WC_DEVICE_CHAR1_UUID >> 12) & 0x000f)];
+    DEVICE_CHAR[5] = UPPER_XDIGITS[(uint8_t)((CONFIG_WC_DEVICE_CHAR1_UUID >> 8) & 0x000f)];
+    DEVICE_CHAR[6] = UPPER_XDIGITS[(uint8_t)((CONFIG_WC_DEVICE_CHAR1_UUID >> 4) & 0x000f)];
+    DEVICE_CHAR[7] = UPPER_XDIGITS[(uint8_t)((CONFIG_WC_DEVICE_CHAR1_UUID) & 0x000f)];
+    device_meta_data = cJSON_CreateObject();
+    cJSON_AddItemToObject(device_meta_data, JSON_BLE_CHAR, cJSON_CreateStringReference(DEVICE_CHAR));
+
+    /* start main task */
+    xTaskCreate(&main_task, "main_task", (1024 * 48), NULL, 5, NULL);
 }
