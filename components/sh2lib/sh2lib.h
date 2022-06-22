@@ -42,6 +42,10 @@ struct sh2lib_handle {
 #define DATA_RECV_RST_STREAM      1
 /** Flag indicating frame is completely received  */
 #define DATA_RECV_FRAME_COMPLETE  2
+/** Flag indicating that a data frame has been sent  */
+#define DATA_SEND_FRAME_DATA      3
+/** Flag indicating connection shutdown  */
+#define DATA_RECV_GOAWAY          4
 
 /**
  * @brief Function Prototype for data receive callback
@@ -52,6 +56,7 @@ struct sh2lib_handle {
  * received on the stream.
  *
  * @param[in] handle     Pointer to the sh2lib handle.
+ * @param[in] stream_id  Stream id.
  * @param[in] data       Pointer to a buffer that contains the data received.
  * @param[in] len        The length of valid data stored at the 'data' pointer.
  * @param[in] flags      Flags indicating whether the stream is reset (DATA_RECV_RST_STREAM) or
@@ -60,7 +65,7 @@ struct sh2lib_handle {
  *
  * @return The function should return 0
  */
-typedef int (*sh2lib_frame_data_recv_cb_t)(struct sh2lib_handle *handle, const char *data, size_t len, int flags);
+typedef int (*sh2lib_frame_data_recv_cb_t)(struct sh2lib_handle *handle, int32_t stream_id, const char *data, size_t len, int flags);
 
 /**
  * @brief Function Prototype for callback to send data in PUT/POST
@@ -70,6 +75,7 @@ typedef int (*sh2lib_frame_data_recv_cb_t)(struct sh2lib_handle *handle, const c
  * function sets the flag NGHTTP2_DATA_FLAG_EOF to indicate end of data.
  *
  * @param[in] handle       Pointer to the sh2lib handle.
+ * @param[in] stream_id    Stream id.
  * @param[out] data        Pointer to a buffer that should contain the data to send.
  * @param[in] len          The maximum length of data that can be sent out by this function.
  * @param[out] data_flags  Pointer to the data flags. The NGHTTP2_DATA_FLAG_EOF
@@ -78,7 +84,7 @@ typedef int (*sh2lib_frame_data_recv_cb_t)(struct sh2lib_handle *handle, const c
  * @return The function should return the number of valid bytes stored in the
  * data pointer
  */
-typedef int (*sh2lib_putpost_data_cb_t)(struct sh2lib_handle *handle, char *data, size_t len, uint32_t *data_flags);
+typedef int (*sh2lib_putpost_data_cb_t)(struct sh2lib_handle *handle,  int32_t stream_id, char *data, size_t len, uint32_t *data_flags);
 
 /**
  * @brief Connect to a URI using HTTP/2
@@ -149,7 +155,7 @@ int sh2lib_do_get(struct sh2lib_handle *hd, const char *path, sh2lib_frame_data_
  *             - ESP_FAIL if the request setup fails
  */
 int sh2lib_do_post(struct sh2lib_handle *hd, const char *path,
-                   int32_t total_len, 
+                   int32_t total_len,
                    sh2lib_putpost_data_cb_t send_cb,
                    sh2lib_frame_data_recv_cb_t recv_cb);
 

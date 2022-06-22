@@ -5,12 +5,19 @@
 #include "driver/gpio.h"
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
+#include "esp_log.h"
 
-//#define LOG_DEBUG
+#if CONFIG_LOG_DEFAULT_LEVEL > 3
+#define LOG_DEBUG
+#endif
 
 extern const char * WC_TAG;
 
 extern const char const DEVICE_NAME [];
+
+#define CAM_MODE_NONE   0x00
+#define CAM_MODE_STREAM 0x01
+#define CAM_MODE_SNAP   0x02
 
 #define ADC_ENABLED
 #define OUT_ENABLED

@@ -162,6 +162,8 @@ typedef struct {
  */
 esp_err_t esp_camera_init(const camera_config_t* config);
 
+esp_err_t esp_camera_set_framesize(framesize_t fsz);
+
 /**
  * @brief Deinitialize the camera driver
  *

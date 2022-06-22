@@ -123,6 +123,9 @@ const char *sh2lib_frame_type_str(int type)
     case NGHTTP2_PING:
         return "PING";
         break;
+    case NGHTTP2_WINDOW_UPDATE:
+        return "WINDOW_UPDATE";
+        break;
     default:
         return "other";
         break;
@@ -132,20 +135,38 @@ const char *sh2lib_frame_type_str(int type)
 static int callback_on_frame_send(nghttp2_session *session,
                                   const nghttp2_frame *frame, void *user_data)
 {
-    ESP_LOGD(TAG, "[frame-send] frame type %s", sh2lib_frame_type_str(frame->hd.type));
+    ESP_LOGD(TAG, "[frame-send][sid=%d] frame type %s", frame->hd.stream_id, sh2lib_frame_type_str(frame->hd.type));
     switch (frame->hd.type) {
+    case NGHTTP2_DATA: {
+#if DBG_FRAME_SEND
+        ESP_LOGD(TAG, "[data-chunk][sid=%d] C ----------------------------> S (DATA chunk)"
+                "%lu bytes",
+                frame->hd.stream_id,
+                (unsigned long int)frame->data.hd.length);
+#endif
+        sh2lib_frame_data_recv_cb_t data_recv_cb = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+        struct sh2lib_handle *h2 = user_data;
+        (*data_recv_cb)(h2, frame->hd.stream_id, (const char *) &(frame->data.hd.length), 0, DATA_SEND_FRAME_DATA);
+        break;
+    }
     case NGHTTP2_HEADERS:
         if (nghttp2_session_get_stream_user_data(session, frame->hd.stream_id)) {
-            ESP_LOGD(TAG, "[frame-send] C ----------------------------> S (HEADERS)");
+            ESP_LOGD(TAG, "[frame-send][sid=%d] C ----------------------------> S (HEADERS)", frame->hd.stream_id );
 #if DBG_FRAME_SEND
-            ESP_LOGD(TAG, "[frame-send] headers nv-len = %d", frame->headers.nvlen);
+            ESP_LOGD(TAG, "[frame-send][sid=%d] headers nv-len = %d", frame->hd.stream_id, frame->headers.nvlen);
             const nghttp2_nv *nva = frame->headers.nva;
             size_t i;
             for (i = 0; i < frame->headers.nvlen; ++i) {
-                ESP_LOGD(TAG, "[frame-send] %s : %s", nva[i].name, nva[i].value);
+                ESP_LOGD(TAG, "[frame-send][sid=%d] %s : %s", frame->hd.stream_id, nva[i].name, nva[i].value);
             }
 #endif
         }
+        break;
+    case NGHTTP2_WINDOW_UPDATE:
+#if DBG_FRAME_SEND
+        ESP_LOGD(TAG, "[frame-send][sid=%d] window update size = %d",
+                        frame->hd.stream_id, frame->window_update.window_size_increment);
+#endif
         break;
     }
     return 0;
@@ -154,15 +175,38 @@ static int callback_on_frame_send(nghttp2_session *session,
 static int callback_on_frame_recv(nghttp2_session *session,
                                   const nghttp2_frame *frame, void *user_data)
 {
-    ESP_LOGD(TAG, "[frame-recv][sid: %d] frame type  %s", frame->hd.stream_id, sh2lib_frame_type_str(frame->hd.type));
-    if (frame->hd.type != NGHTTP2_DATA) {
-        return 0;
-    }
-    /* Subsequent processing only for data frame */
-    sh2lib_frame_data_recv_cb_t data_recv_cb = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
-    if (data_recv_cb) {
-        struct sh2lib_handle *h2 = user_data;
-        (*data_recv_cb)(h2, NULL, 0, DATA_RECV_FRAME_COMPLETE);
+    ESP_LOGD(TAG, "[frame-recv][sid=%d] frame type  %s", frame->hd.stream_id, sh2lib_frame_type_str(frame->hd.type));
+    switch (frame->hd.type) {
+        case NGHTTP2_DATA: {
+            /* Subsequent processing only for data frame */
+            sh2lib_frame_data_recv_cb_t data_recv_cb =
+                nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+            if (data_recv_cb) {
+                struct sh2lib_handle *h2 = user_data;
+                (*data_recv_cb)(h2, frame->hd.stream_id, NULL, 0, DATA_RECV_FRAME_COMPLETE);
+            }
+            break;
+        }
+        case NGHTTP2_WINDOW_UPDATE: {
+    #if DBG_FRAME_SEND
+            ESP_LOGD(TAG, "[frame-recv][sid=%d] window update size = %d",
+                        frame->hd.stream_id, frame->window_update.window_size_increment);
+    #endif
+            break;
+        }
+        case NGHTTP2_GOAWAY: {
+    #if DBG_FRAME_SEND
+            ESP_LOGD(TAG, "[frame-recv][sid=%d] goaway strid = %d error_code = %d",
+                        frame->hd.stream_id, frame->goaway.last_stream_id, frame->goaway.error_code);
+    #endif
+            sh2lib_frame_data_recv_cb_t data_recv_cb =
+            nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+            if (data_recv_cb) {
+                struct sh2lib_handle *h2 = user_data;
+                (*data_recv_cb)(h2, frame->hd.stream_id, NULL, 0, DATA_RECV_GOAWAY);
+            }
+            break;
+        }
     }
     return 0;
 }
@@ -171,11 +215,11 @@ static int callback_on_stream_close(nghttp2_session *session, int32_t stream_id,
                                     uint32_t error_code, void *user_data)
 {
 
-    ESP_LOGD(TAG, "[stream-close][sid %d]", stream_id);
+    ESP_LOGD(TAG, "[stream-close][sid=%d]", stream_id);
     sh2lib_frame_data_recv_cb_t data_recv_cb = nghttp2_session_get_stream_user_data(session, stream_id);
     if (data_recv_cb) {
         struct sh2lib_handle *h2 = user_data;
-        (*data_recv_cb)(h2, NULL, 0, DATA_RECV_RST_STREAM);
+        (*data_recv_cb)(h2, stream_id, NULL, 0, DATA_RECV_RST_STREAM);
     }
     return 0;
 }
@@ -185,14 +229,15 @@ static int callback_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
                                        size_t len, void *user_data)
 {
     sh2lib_frame_data_recv_cb_t data_recv_cb;
-    ESP_LOGD(TAG, "[data-chunk][sid:%d]", stream_id);
+    ESP_LOGD(TAG, "[data-chunk][sid=%d]", stream_id);
     data_recv_cb = nghttp2_session_get_stream_user_data(session, stream_id);
     if (data_recv_cb) {
-        ESP_LOGD(TAG, "[data-chunk] C <---------------------------- S (DATA chunk)"
+        ESP_LOGD(TAG, "[data-chunk][sid=%d] C <---------------------------- S (DATA chunk)"
                 "%lu bytes",
+                stream_id,
                 (unsigned long int)len);
         struct sh2lib_handle *h2 = user_data;
-        (*data_recv_cb)(h2, (char *)data, len, 0);
+        (*data_recv_cb)(h2, stream_id, (char *)data, len, 0);
         /* TODO: What to do with the return value: look for pause/abort */
     }
     return 0;
@@ -202,7 +247,7 @@ static int callback_on_header(nghttp2_session *session, const nghttp2_frame *fra
                               const uint8_t *name, size_t namelen, const uint8_t *value,
                               size_t valuelen, uint8_t flags, void *user_data)
 {
-    ESP_LOGD(TAG, "[hdr-recv][sid:%d] %s : %s", frame->hd.stream_id, name, value);
+    ESP_LOGD(TAG, "[hdr-recv][sid=%d] %s : %s", frame->hd.stream_id, name, value);
     return 0;
 }
 
@@ -325,7 +370,7 @@ ssize_t sh2lib_data_provider_cb(nghttp2_session *session, int32_t stream_id, uin
 {
     struct sh2lib_handle *h2 = user_data;
     sh2lib_putpost_data_cb_t data_cb = source->ptr;
-    return (*data_cb)(h2, (char *)buf, length, data_flags);
+    return (*data_cb)(h2, stream_id, (char *)buf, length, data_flags);
 }
 
 int sh2lib_do_putpost_with_nv(struct sh2lib_handle *hd, const nghttp2_nv *nva, size_t nvlen,
@@ -368,6 +413,7 @@ int sh2lib_do_put(struct sh2lib_handle *hd, const char *path,
                                SH2LIB_MAKE_NV(":scheme", "https"),
                                SH2LIB_MAKE_NV(":authority", hd->hostname),
                                SH2LIB_MAKE_NV(":path", path),
+                               SH2LIB_MAKE_NV("content-length", "21474836480"),
                              };
     return sh2lib_do_putpost_with_nv(hd, nva, sizeof(nva) / sizeof(nva[0]), send_cb, recv_cb);
 }

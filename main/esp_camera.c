@@ -289,6 +289,18 @@ fail:
     return err;
 }
 
+esp_err_t esp_camera_set_framesize(framesize_t fsz) {
+    cam_stop();
+    s_state->sensor.status.framesize = fsz;
+    if (s_state->sensor.set_framesize(&s_state->sensor, fsz) != 0) {
+        ESP_LOGE(TAG, "Failed to set frame size");
+        esp_camera_deinit();
+        return ESP_ERR_CAMERA_FAILED_TO_SET_FRAME_SIZE;
+    }
+    cam_start();
+    return ESP_OK;
+}
+
 esp_err_t esp_camera_deinit()
 {
     esp_err_t ret = cam_deinit();

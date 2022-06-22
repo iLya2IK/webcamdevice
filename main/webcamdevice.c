@@ -66,6 +66,11 @@ static esp_timer_handle_t adc_probe;
 #define ADC_PROBE_TIMER_DELTA 2000000
 #endif
 
+/* Frame size for snap */
+#define CAM_SNAP_FRAMESIZE FRAMESIZE_SXGA
+/* Frame size for streaming. must be less or equal CAM_SNAP_FRAMESIZE */
+#define CAM_STREAM_FRAMESIZE FRAMESIZE_VGA
+
 /* camera config - ov2640 driver */
 static camera_config_t camera_config = {
     .pin_pwdn = CAM_PIN_PWDN,
@@ -91,8 +96,8 @@ static camera_config_t camera_config = {
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
-    .pixel_format = PIXFORMAT_JPEG, //PIXFORMAT_RGB565, //YUV422,GRAYSCALE,RGB565,JPEG
-    .frame_size = FRAMESIZE_SXGA,    //QQVGA-UXGA Do not use sizes above QVGA when not JPEG
+    .pixel_format = PIXFORMAT_JPEG,   //PIXFORMAT_RGB565, //YUV422,GRAYSCALE,RGB565,JPEG
+    .frame_size = CAM_SNAP_FRAMESIZE, //QQVGA-UXGA Do not use sizes above QVGA when not JPEG
 
     .jpeg_quality = 12, //0-63 lower number means higher quality
     .fb_count = 1,       //if more than one, i2s runs in continuous mode. Use only with JPEG
@@ -100,6 +105,8 @@ static camera_config_t camera_config = {
 
     .fb_location = CAMERA_FB_IN_PSRAM
 };
+
+volatile int8_t cur_cam_mode = CAM_MODE_SNAP;
 
 /* wifi config */
 #define APP_WIFI_SSID CONFIG_WIFI_SSID
@@ -122,6 +129,7 @@ const int WIFI_CONNECTED_BIT = BIT0;
 /* Commands */
 #define HTTP2_STREAMING_AUTH_PATH     "/authorize.json"
 #define HTTP2_STREAMING_ADDREC_PATH   "/addRecord.json?shash="
+#define HTTP2_STREAMING_OUT_PATH      "/input.raw?shash="
 #define HTTP2_STREAMING_GETMSGS_PATH  "/getMsgsAndSync.json"
 #define HTTP2_STREAMING_ADDMSGS_PATH  "/addMsgs.json"
 
@@ -204,6 +212,7 @@ static const char * JSON_RPC_PIN         =  "pin";
 #define MODE_AUTH 0x0002
 // add new frame to server. is need to send camera framebuffer
 #define MODE_SEND_FB  0x0004
+#define MODE_STREAM_NEXT_FRAME 0x0010
 // get messages from server. is need to get messages
 #define MODE_GET_MSG  0x0008
 // send msg. is need to send msg from pool to server
@@ -277,8 +286,10 @@ static void locked_CLR_ALL_STATES() {
 /* timers */
 static esp_timer_handle_t msgs_get;
 static esp_timer_handle_t msgs_send;
+static esp_timer_handle_t msgs_stream;
 #define GET_MSG_TIMER_DELTA 5000000
 #define SEND_MSG_TIMER_DELTA 5000000
+#define STREAM_NEXT_FRAME_TIMER_DELTA 1000000
 
 /* forward decrlarations */
 void finalize_app();
@@ -384,33 +395,37 @@ static void send_authorize() {
     }
 
     cJSON_AddStringToObject(tosend, JSON_RPC_DEVICE, mac_str);
-    cJSON_AddItemToObject(tosend, JSON_RPC_META,   device_meta_data);
+    cJSON_AddItemReferenceToObject(tosend, JSON_RPC_META, device_meta_data);
     h2pc_prepare_to_send(tosend);
     cJSON_Delete(tosend);
     h2pc_do_post(HTTP2_STREAMING_AUTH_PATH);
     h2pc_wait_for_response();
-    /* extract sid */
-    cJSON * resp = h2pc_consume_response_content();
-    if (resp) {
-        cJSON * shash = cJSON_GetObjectItem(resp, JSON_RPC_SHASH);
-        if (shash) {
-            char * hash = shash->valuestring;
-            sid = cJSON_malloc(strlen(hash) + 1);
-            strcpy(sid, hash);
-            locked_CLR_STATE(MODE_AUTH);
-            locked_SET_STATE(MODE_GET_MSG);
-            ESP_LOGI(WC_TAG, "hash=%s",sid);
-            protocol_errors = 0;
+    if (h2pc_connected()) {
+        /* extract sid */
+        cJSON * resp = h2pc_consume_response_content();
+        if (resp) {
+            cJSON * shash = cJSON_GetObjectItem(resp, JSON_RPC_SHASH);
+            if (shash) {
+                char * hash = shash->valuestring;
+                sid = cJSON_malloc(strlen(hash) + 1);
+                strcpy(sid, hash);
+                locked_CLR_STATE(MODE_AUTH);
+                locked_SET_STATE(MODE_GET_MSG);
+                ESP_LOGI(WC_TAG, "hash=%s",sid);
+                protocol_errors = 0;
 
-            strcpy(last_stamp, REST_SYNC_MSG);
-        } else {
-            consume_protocol_error(resp);
+                strcpy(last_stamp, REST_SYNC_MSG);
+            } else {
+                consume_protocol_error(resp);
+            }
+            cJSON_Delete(resp);
         }
-        cJSON_Delete(resp);
+    } else {
+        disconnect_host();
     }
 }
 
-static void send_framebuffer() {
+static void send_snap() {
     camera_fb_t *pic = esp_camera_fb_get();
 
     // use pic->buf to access the image
@@ -429,17 +444,52 @@ static void send_framebuffer() {
 
     esp_camera_fb_return(pic);
 
-    /* extract result */
-    cJSON * resp = h2pc_consume_response_content();
-    if (resp) {
-        cJSON * result = cJSON_GetObjectItem(resp, JSON_RPC_RESULT);
-        if (result &&
-            (strcmp(result->valuestring, JSON_RPC_OK) == 0)) {
-            locked_CLR_STATE(MODE_SEND_FB);
-        } else {
-            consume_protocol_error(resp);
+    if (h2pc_connected()) {
+        /* extract result */
+        cJSON * resp = h2pc_consume_response_content();
+        if (resp) {
+            cJSON * result = cJSON_GetObjectItem(resp, JSON_RPC_RESULT);
+            if (result &&
+                (strcmp(result->valuestring, JSON_RPC_OK) == 0)) {
+                locked_CLR_STATE(MODE_SEND_FB);
+            } else {
+                consume_protocol_error(resp);
+            }
+            cJSON_Delete(resp);
         }
-        cJSON_Delete(resp);
+    } else {
+        disconnect_host();
+    }
+}
+
+static void send_next_frame() {
+    camera_fb_t *pic = esp_camera_fb_get();
+
+    // use pic->buf to access the image
+    ESP_LOGI(WC_TAG, "Picture taken. Its size was: %zu bytes", pic->len);
+
+    // prepare path?query string
+
+    h2pc_prepare_frame((char *) pic->buf, pic->len);
+    char * aPath = NULL;
+
+    if (!h2pc_is_streaming()) {
+        aPath = cJSON_malloc(128);
+        memset(aPath, 0, 128);
+        memcpy(aPath, HTTP2_STREAMING_OUT_PATH, sizeof(HTTP2_STREAMING_OUT_PATH)-1);
+        encode_sid(&(aPath[sizeof(HTTP2_STREAMING_OUT_PATH)-1]));
+        h2pc_prepare_out_stream(aPath);
+    }
+
+    h2pc_wait_for_frame_sending();
+    if (aPath) cJSON_free(aPath);
+
+    esp_camera_fb_return(pic);
+
+    if (h2pc_connected()) {
+        locked_CLR_STATE(MODE_STREAM_NEXT_FRAME);
+    } else {
+        disconnect_host();
     }
 }
 
@@ -693,14 +743,39 @@ static void initialise_wifi(void)
 static esp_err_t init_camera()
 {
     //initialize the camera
+    //
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK)
     {
         ESP_LOGE(WC_TAG, "Camera Init Failed");
         return err;
     }
-
     return ESP_OK;
+}
+
+static esp_err_t set_camera_buffer_size(int8_t  acam_mode)
+{
+    if (acam_mode != cur_cam_mode) {
+        cur_cam_mode = acam_mode;
+        uint8_t fsz;
+        switch (cur_cam_mode)
+        {
+        case CAM_MODE_SNAP:
+            fsz = CAM_SNAP_FRAMESIZE;
+            break;
+        case CAM_MODE_STREAM:
+            fsz = CAM_STREAM_FRAMESIZE;
+            break;
+        default:
+            fsz = 0;
+            break;
+        }
+        if (fsz > 0) {
+            //do change framesize
+            return esp_camera_set_framesize(fsz);
+        }
+    }
+    return 0;
 }
 
 #ifdef INP_ENABLED
@@ -842,6 +917,16 @@ void msgs_send_cb(void* arg)
     }
 }
 
+void msgs_stream_cb(void* arg)
+{
+    ESP_LOGD(WC_TAG, "Stream next frame fired");
+    if (xSemaphoreTake(states_mux, portMAX_DELAY) == pdTRUE) {
+        if (CHK_STATE(MODE_CONN))
+            SET_STATE(MODE_STREAM_NEXT_FRAME);
+        xSemaphoreGive(states_mux);
+    }
+}
+
 static void main_task(void *args)
 {
     nvs_handle my_handle;
@@ -857,6 +942,10 @@ static void main_task(void *args)
             nvs_get_str(my_handle, JSON_CFG, cfg_str, &required_size);
             loc_cfg = cJSON_Parse(cfg_str);
             cJSON_free(cfg_str);
+            ESP_LOGD(JSON_CFG, "JSON cfg founded");
+            #ifdef LOG_DEBUG
+            esp_log_buffer_char(JSON_CFG, cfg_str, strlen(cfg_str));
+            #endif
         }
     }
     if (loc_cfg == NULL) {
@@ -892,12 +981,11 @@ static void main_task(void *args)
 
         if (WC_CFG_VALUES != NULL) {
             char * cfg_str = cJSON_PrintUnformatted(WC_CFG_VALUES);
-            size_t required_size = strlen(cfg_str);
-            nvs_set_blob(my_handle, JSON_CFG, cfg_str, required_size);
+            nvs_set_str(my_handle, JSON_CFG, cfg_str);
             nvs_commit(my_handle);
 
             #ifdef LOG_DEBUG
-            esp_log_buffer_char(JSON_CFG, cfg_str, required_size);
+            esp_log_buffer_char(JSON_CFG, cfg_str, strlen(cfg_str));
             #endif
 
             cJSON_free(cfg_str);
@@ -928,14 +1016,18 @@ static void main_task(void *args)
     timer_args.callback = &msgs_send_cb;
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &msgs_send));
 
+    timer_args.callback = &msgs_stream_cb;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &msgs_stream));
+
     #ifdef ADC_ENABLED
     timer_args.callback = &adc_probe_cb;
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &msgs_send));
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &adc_probe));
     #endif
 
     /* start timers */
     esp_timer_start_periodic(msgs_get, GET_MSG_TIMER_DELTA);
     esp_timer_start_periodic(msgs_send, SEND_MSG_TIMER_DELTA);
+    esp_timer_start_periodic(msgs_stream, STREAM_NEXT_FRAME_TIMER_DELTA);
     #ifdef ADC_ENABLED
     esp_timer_start_periodic(adc_probe, ADC_PROBE_TIMER_DELTA);
     #endif
@@ -984,9 +1076,17 @@ static void main_task(void *args)
         }
         /* send framebuffer */
         if (locked_CHK_STATE(MODE_SEND_FB)) {
+            ESP_ERROR_CHECK(set_camera_buffer_size(CAM_MODE_SNAP));
             esp_camera_do_snap();
-            vTaskDelay(1000);
-            send_framebuffer();
+            vTaskDelay(500);
+            send_snap();
+            ESP_ERROR_CHECK(set_camera_buffer_size(CAM_MODE_STREAM));
+        }
+        /* stream framebuffer */
+        if (locked_CHK_STATE(MODE_STREAM_NEXT_FRAME)) {
+            ESP_ERROR_CHECK(set_camera_buffer_size(CAM_MODE_STREAM));
+            esp_camera_do_snap();
+            send_next_frame();
         }
 
         #ifdef ADC_ENABLED
@@ -1002,7 +1102,7 @@ static void main_task(void *args)
             disconnect_host();
         }
 
-        vTaskDelay(1000);
+        vTaskDelay(200);
     }
 
     finalize_app();
@@ -1017,6 +1117,7 @@ void finalize_app()
 
     esp_timer_stop(msgs_send);
     esp_timer_stop(msgs_get);
+    esp_timer_stop(msgs_stream);
     #ifdef ADC_ENABLED
     esp_timer_stop(adc_probe);
     #endif

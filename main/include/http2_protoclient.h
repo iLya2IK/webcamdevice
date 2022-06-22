@@ -16,12 +16,19 @@
 #define MAXIMUM_RESP_BUFFER 0x200000
 
 void h2pc_initialize();
+bool h2pc_connected();
 bool h2pc_connect_to_http2(char * aserver);
 void h2pc_prepare_to_send(cJSON * tosend);
 void h2pc_prepare_to_send_static(char * buf, int size);
 void h2pc_do_post(char * aPath);
 bool h2pc_wait_for_response();
 cJSON * h2pc_consume_response_content();
+
+bool h2pc_is_streaming();
+void h2pc_prepare_frame(char * buf, int size);
+void h2pc_prepare_out_stream(char * aPath);
+bool h2pc_wait_for_frame_sending();
+
 void h2pc_disconnect_http2();
 
 bool h2pc_locked_incoming_pool_waiting();
