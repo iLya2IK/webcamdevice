@@ -207,3 +207,39 @@ menu "Camera driver configuration"
             Larger values may fail to allocate due to insufficient contiguous memory blocks, and smaller value may cause DMA interrupt to be too frequent
 
 endmenu
+
+
+menu "WC and H2PC configuration"
+
+    config WC_USE_IO_STREAMS
+        bool "Use IO streams"
+        default n
+        help
+            Disable of enable io frame streaming for WCClient
+            
+    config H2PC_MAX_ALLOWED_FRAMES
+        int "Max allowed number of incoming frames"        
+        default 32
+        help
+            Maximum size of the incoming frames pool. If exceeds - new frames are ignored            
+            
+    config H2PC_MAX_ALLOWED_FRAMES_SIZE
+        hex "Max allowed total size of incoming frames in bytes"
+        default 0x100000
+        help
+            Maximum size in bytes of the incoming frames pool. If exceeds - new frames are ignored
+
+    config H2PC_INITIAL_RESP_BUFFER
+        hex "Initial resp buffer"
+        default 0x8000
+        help
+            Defines the initial size in bytes of the response buffer
+            
+    config H2PC_MAXIMUM_RESP_BUFFER
+        hex "Maximum resp buffer"
+        default 0x200000
+        help
+            Defines the maximum size in bytes of the response buffer
+                   
+            
+endmenu
