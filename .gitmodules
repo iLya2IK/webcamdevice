@@ -7,3 +7,6 @@
 [submodule "components/ble_config"]
 	path = components/wc_ble_config
 	url = git@github.com:iLya2IK/wc_ble_config.git
+[submodule "components/wch2pc_app"]
+	path = components/wch2pc_app
+	url = git@github.com:iLya2IK/wch2pc_app.git

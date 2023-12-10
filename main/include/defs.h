@@ -1,19 +1,31 @@
 #ifndef DEFS_H_
 #define DEFS_H_
 
-#include "iot_button.h"
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <cJSON.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_event_loop.h"
 #include "driver/gpio.h"
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
+
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+
+#include "iot_button.h"
 
 #if CONFIG_LOG_DEFAULT_LEVEL > 3
 #define LOG_DEBUG
 #endif
 
 extern const char * WC_TAG;
-
-extern const char const DEVICE_NAME [];
 
 #define CAM_MODE_NONE   0x00
 #define CAM_MODE_STREAM 0x01
